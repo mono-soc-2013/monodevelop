@@ -807,15 +807,17 @@ namespace MonoDevelop.Ide.TypeSystem
 		#endregion
 		
 		#region Project loading
+
 		public static void Load (WorkspaceItem item)
 		{
-			using (Counters.ParserService.WorkspaceItemLoaded.BeginTiming ()) {
-				InternalLoad (item);
-				CleanupCache ();
-			}
+			ThreadPool.QueueUserWorkItem (delegate {
+				using (Counters.ParserService.WorkspaceItemLoaded.BeginTiming ()) {
+					InternalLoad (item);
+					CleanupCache ();
+				}
+			});
 		}
-		
-		
+
 		static void InternalLoad (WorkspaceItem item)
 		{
 			if (item is Workspace) {
@@ -826,9 +828,28 @@ namespace MonoDevelop.Ide.TypeSystem
 				ws.ItemRemoved += OnWorkspaceItemRemoved;
 			} else if (item is Solution) {
 				var solution = (Solution)item;
-				Parallel.ForEach (solution.GetAllProjects (), project => LoadProject (project));
+				Parallel.ForEach (solution.GetAllProjects (), project => LoadProject (project, false));
 				var contents = projectContents.Values.ToArray ();
 				ReloadAllReferences (contents);
+
+				// Schedule the scan once here instead of inside LoadProject to avoid
+				// hammering the ThreadPool with blocking tasks and causing thread pool thread starvation
+				// All the Tasks synchronize on projectWrapperUpdateLock and wait for it to be released.
+				// In CheckModifiedFiles there is a check to see if a file should be parsed, it accesses content.Content,
+				// which may block while the project is loaded. In this case is does because the task to load the
+				// project is stuck in queue behind all the tasks used to check for modified files.
+				// This causes a deadlock-like symptom where MD hangs for a (potentially long) time
+				// until the ThreadPool has spun enough threads to let the LazyProjectLoader task run.
+				// After this is complete it all works out fine since the deadlock-ish
+				// situation has been resolved. Anyway, this way we only use Environment.ProcessorCount
+				// tasks so the problem isn't as severe.
+				Task.Factory.StartNew(delegate {
+					Parallel.ForEach (solution.GetAllProjects (), project => {
+						var files = project.Files.ToArray ();
+						var wrapper = GetProjectContentWrapper (project);
+						CheckModifiedFiles (project, files, wrapper);
+					});
+				});
 
 				solution.SolutionItemAdded += OnSolutionItemAdded;
 				solution.SolutionItemRemoved += OnSolutionItemRemoved;
@@ -1404,6 +1425,11 @@ namespace MonoDevelop.Ide.TypeSystem
 
 		public static ProjectContentWrapper LoadProject (Project project)
 		{
+			return LoadProject (project, true);
+		}
+
+		static ProjectContentWrapper LoadProject (Project project, bool checkFileModification)
+		{
 			if (IncLoadCount (project) != 1) 
 				return null;
 			lock (projectContentLock) {
@@ -1421,10 +1447,13 @@ namespace MonoDevelop.Ide.TypeSystem
 					project.FileRemovedFromProject += OnFileRemoved;
 					project.FileRenamedInProject += OnFileRenamed;
 					project.Modified += OnProjectModified;
-					var files = project.Files.ToArray ();
-					Task.Factory.StartNew (delegate {
-						CheckModifiedFiles (project, files, wrapper);
-					});
+					
+					if (checkFileModification) {
+						var files = project.Files.ToArray ();
+						Task.Factory.StartNew (delegate {
+							CheckModifiedFiles (project, files, wrapper);
+						});
+					}
 
 					if (dotNetProject != null) {
 						StartFrameworkLookup (dotNetProject);
